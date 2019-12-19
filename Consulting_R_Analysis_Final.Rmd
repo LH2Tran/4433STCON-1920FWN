@@ -1,0 +1,212 @@
+---
+title: "Proposed analysis HR comparinsons"
+author: "Patrick van Hage & Ha-Lan Tran"
+output:
+  pdf_document:
+    toc: yes
+  html_document:
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warnings = FALSE, comments = FALSE)
+```
+
+
+Below the analysis to answer the question how to compare two hazard ratios: (1) 'all cases' vs 'controls' and (2) 'subset cases' vs 'controls.' Cases refer to long-lived families, whereas cases refer to families that are not considered long-lived. The term 'long-lived' refers to people beloning to the top $10\%$ of their birth cohort. 
+
+Because the two hazard ratios have the same reference group, i.e. the controls, the comparinson can be simplified to comparing 'all cases - subset' with 'subset.' We propose the fitting of frailty Cox models to fit the data, after which an `anova` can be used see whether there is a significant difference. The robustness of this approach is confirmed through simulation, also discussed below.
+
+## Load packages and data
+
+```{r}
+library(coxme)
+library(survminer)
+library(readr)
+library(tidyverse)
+Links_data <- read_csv("LINKS_StudentConsultationDatabase_20190923_def.csv")
+```
+
+## Extract hazard ratios proposed models
+
+```{r}
+# All cases vs controls
+cox_all <- coxme(Surv(age, overleden_compleet) ~ factor(LLRP_NoRelSelect_and_NoSpousal_longevity) + (1|famid), data = Links_data)
+summary(cox_all)
+
+# Calculate hazard ratio case:control and 95% CI
+beta1 <- unname(cox_all$coefficients)
+se1 <- sqrt(vcov(cox_all))
+round(c(`hazard ratio` = exp(beta1), 
+        `2.5%` = exp(beta1 - 1.96 * se1), `97.5%` = exp(beta1 + 1.96 * se1)), 2) 
+```
+
+```{r}
+# Subset cases vs controls
+cox_sub <- coxme(Surv(age, overleden_compleet) ~ factor(LLRP_ExcludingNLRelatives_and_NoSpousal_longevity2) + (1|famid), data = Links_data)
+summary(cox_sub)
+
+# Calculate hazard ratio case:control and 95% CI
+beta2 <- unname(cox_sub$coefficients)
+se2 <- sqrt(vcov(cox_sub))
+round(c(`hazard ratio` = exp(beta2), 
+        `2.5%` = exp(beta2 - 1.96 * se2), `97.5%` = exp(beta2 + 1.96 * se2)), 2)
+```
+
+## Kapler-Meier plot
+
+By splitting off the subset cases, and label them seperately from all cases, we are able to construct a KM curve. The curve already shows some overlap in CI between subset and all cases. This is partially due to subset being part of all cases, and subset having a lower sample size. The KM curve, along with the risk table are functions from `survminer`. 
+
+```{r}
+# Split subset off as seperate group and add labels
+Links_subset <- Links_data[Links_data$LLRP_ExcludingNLRelatives_and_NoSpousal_longevity2 == 1, ]
+Links_data$KMlabel <- ifelse(Links_data$LLRP_NoRelSelect_and_NoSpousal_longevity == 1, "Case", "Control") 
+Links_subset$KMlabel <- rep("Subset", nrow(Links_subset))
+Links_KM_curves <- rbind(Links_data, Links_subset)
+
+# Plot construction
+Links.km <- survfit(Surv(age, overleden_compleet) ~ KMlabel, data = Links_KM_curves)
+ggsurvplot(Links.km, conf.int = T,  ggtheme = theme_bw(),
+           xlab = "Age (years)", legend.title = "", legend.labs = c("Control", "Case", "Subset"),
+           censor.shape = 124, censor.size = 3,
+           font.x = c(16), font.y = c(16), font.legend = list(size = 14),
+           risk.table = TRUE, tables.height = 0.2, tables.theme = theme_cleantable())
+```
+
+## Simulation study type I error and power 
+
+N.B. These will take a while to run.
+
+### Data generation and classification
+
+With many thanks to M. Rodriguez-Girondo (2019) for providing the `R` code for set-up. 
+
+```{r}
+###########################################################################################
+#Function for simulation of family data according to shared gamma frailty model           #
+#n[i]: number of families of size kvec[i] (n is a vector of the same length than kvec)    #
+#kvec:size of the families (vector)                                                       #
+#sigma: variance of gamma frailty                                                         #
+###########################################################################################
+
+sim.data<-function(n,kvec,sigma,bi.cens,bf.cens,beta){
+
+
+k.list<-lapply(1:length(n),function(i)rep(kvec[i],n[i]))
+k<-c(k.list[[1]])
+for (i in 2:length(n))
+{k<-c(k,k.list[[i]])
+}
+
+k<-sample(k,length(k))
+nn<-sum(table(k)*sort(unique(k)))
+u<-rep(rgamma(length(k), scale=sigma, shape= 1/sigma),k) # sigma is the variance of id 
+x<-c(rep(1,nn/2),rep(0,nn/2)) # binary covariate
+x<-sample(x,length(x))
+myrates<-u*exp(beta*x) # rate parameter for exponential survival times
+y<-rexp(length(x),rate=myrates)
+idi<-rep(1:nn)
+id<-rep(1:length(k),k) # unique family id
+kk<-rep(k,k)
+c<-runif(nn,bi.cens,bf.cens) # random uniform censoring
+y<-sapply(1:nn,function(i)min(y[i],c[i]))
+d<-sapply(1:nn,function(i)ifelse(y[i]<c[i],1,0)) # status indicator
+mat<-data.frame(idi=idi,id=id,d=d,x=x,y=y,kk=kk,u=u)
+return(list(mat=mat))
+}
+```
+
+### Overview simulation process
+
+We generate the data using the simulation function. Then we select the F3 of top 10% cases and assign a 1 to them, and a 0 to the controls. The variable is called `LL_parent`.  
+
+```{r}
+set.seed(123)
+example<-sim.data(n=c(1000,1000,1000),kvec=c(10,10,10),sigma=0.5,bi.cens=100,bf.cens=1000,beta=0)
+relative.age <- unique(example$mat[, c("u", "id")])
+top_10 <- relative.age[relative.age$u >= quantile(relative.age$u,prob = 0.9),] 
+example$mat$LL_parent <- ifelse(example$mat$id %in% top_10$id, 1, 0) 
+```
+
+Then we select random families from top $10\%$ as subset from  which we indicate as the F3 with at least 1 LL ancestor (next to their parent) and assign 1 to those. We assign 0 to the reset (non-subset). This variable is called `LL_ancestor`. 
+
+```{r}
+top_10_subset <- sample(top_10$id, 150)
+example$mat$LL_ancestor <- ifelse(example$mat$id %in% top_10_subset, 1, 0)
+```
+
+### Simulated comparison applying LRT method
+
+Multiple occassions were found of people comparing coxme models with different frailties, and those models indeed bear a difference in the loglikelihood. Thus, the LRT function does take the frailties into account. Comparing the models using this method, we do find no signficant difference as expected for randomly assigned subset/non-subset. However, we should simplify the formula above and run the simulation for 1000 iterations to determine the false positive generation rate. Notice that both models leave out the controls, after which we compare a model describes an overall survival of all cases (model_1) versus a model that seperates survival of subset and non-subset within the cases (model_2).
+
+```{r}
+model_1 <- coxme(Surv(y, d) ~ (1|id), data = example$mat[example$mat$LL_parent != 0, ])
+model_2 <- coxme(Surv(y, d) ~ factor(LL_ancestor) + (1|id), data = example$mat[example$mat$LL_parent != 0, ])
+anova(model_1, model_2)
+```
+
+### Simulation of false positive rate LRT method
+
+Following the above procedure, we simulated the procedure to get a false positive rate if the subset is equal to all cases. We founda  false positive rate of roughly 0.05 during the run, which should indicate the use of anova should be appropriate. However, we should still take into account whether the inference is right. We would like to find a 5% (0.05) false positive rate.
+
+```{r}
+set.seed(123)
+p_val <- numeric(1000)
+for(i in 1:1000){
+  # Data generation (see above)
+  surv.data <- sim.data(n=c(1000,1000,1000),kvec=c(10,10,10),sigma=0.5,bi.cens=100,bf.cens=1000,beta=0)
+  relative.age <- unique(surv.data$mat[, c("u", "id")])
+  top_10 <- relative.age[relative.age$u >= quantile(relative.age$u,prob = 0.9),] 
+  surv.data$mat$LL_parent <- ifelse(surv.data$mat$id %in% top_10$id, 1, 0) 
+  top_10_subset <- sample(top_10$id, 150)
+  surv.data$mat$LL_ancestor <- ifelse(surv.data$mat$id %in% top_10_subset, 1, 0) 
+  
+  # come model generation and LRT comparison
+  model_1 <- coxme(Surv(y, d) ~ (1|id), data = surv.data$mat[surv.data$mat$LL_parent != 0, ])
+  model_2 <- coxme(Surv(y, d) ~ factor(LL_ancestor) + (1|id), data = surv.data$mat[surv.data$mat$LL_parent != 0, ])
+  p_val[i] <- anova(model_1, model_2)$`P(>|Chi|)`[2]
+}
+mean(p_val < 0.05)
+```
+
+### Simulation of power with informative u as subset (top 5) LRT method
+
+Here, we select the top $5\%$ as our subset and check how often we find a signficant result to test the power of our method. This resulted in a power of $1$, meaning that we will always find a significant difference, if there is a true difference. 
+
+```{r}
+set.seed(123)
+p_val <- numeric(1000)
+for(i in 1:1000){
+  # Data generation (see above)
+  surv.data <- sim.data(n=c(1000,1000,1000),kvec=c(10,10,10),sigma=0.5,bi.cens=100,bf.cens=1000,beta=0)
+  relative.age <- unique(surv.data$mat[, c("u", "id")])
+  top_10 <- relative.age[relative.age$u >= quantile(relative.age$u,prob = 0.9),] 
+  surv.data$mat$LL_parent <- ifelse(surv.data$mat$id %in% top_10$id, 1, 0) 
+  top_10_subset <-  relative.age[relative.age$u >= quantile(relative.age$u, prob = 0.95),] # select top 5
+  surv.data$mat$LL_ancestor <- ifelse(surv.data$mat$id %in% top_10_subset$id, 1, 0) 
+  
+  # come model generation and LRT comparison
+  model_1 <- coxme(Surv(y, d) ~ (1|id), data = surv.data$mat[surv.data$mat$LL_parent != 0, ])
+  model_2 <- coxme(Surv(y, d) ~ factor(LL_ancestor) + (1|id), data = surv.data$mat[surv.data$mat$LL_parent != 0, ])
+  p_val[i] <- anova(model_1, model_2)$`P(>|Chi|)`[2]
+}
+mean(p_val < 0.05)
+```
+
+## Reconstruct LINKS cox models for LRT comparison - 1 LL relative
+
+Since the simulation confirmed the validty of the approach, we now apply the method to compare all cases against a subset defined by having 1 additional LL relative. First we create an aditional column to convert all the NA from the non-subset cases to 0 (1 = subset; 0 = non-subset). 
+
+Then we proceed with a model that removes the controls from the dataset, and create a model 1. for all cases; and a model 2. for subset cases vs non-subset cases. 
+
+After that, we proceed with the a Likelihood Ratio Test to determine whether the models differ signficantly from one another. As of the current set up, the analysis of variance did not find a significant difference between the two models, meaning that the presence of 1 additional LL relative does not significantly increase the survival probabilty compared to having no additional LL relative.
+
+```{r}
+Links_data$LLRP_1LLR <- Links_data$LLRP_ExcludingNLRelatives_and_NoSpousal_longevity2
+Links_data$LLRP_1LLR[is.na(Links_data$LLRP_1LLR)] <- 0 # Convert the NA to non-subset
+
+Links.cox.cases <- coxme(Surv(age, overleden_compleet) ~ (1 | famid), 
+                         data = Links_data[Links_data$LLRP_NoRelSelect_and_NoSpousal_longevity == 1, ])
+Links.cox.subset <- coxme(Surv(age, overleden_compleet) ~ factor(LLRP_1LLR) + (1 | famid), data = Links_data[Links_data$LLRP_NoRelSelect_and_NoSpousal_longevity == 1, ])
+anova(Links.cox.cases, Links.cox.subset)
+```
